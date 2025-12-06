@@ -1,19 +1,262 @@
 # nervous_detector_voice.py
 # ------------------------------------------------------------
+# Pure audio/text nervousness detector
 #
-# - Use audio fluency cues as the main signal:
-#     silence_ratio + pause stats + energy instability (scale-invariant) + loudness/speaking-rate change
-# - Text cues are secondary support only (hedges/repairs/repeats/etc.).
-# - Expected answer time rule:
-#     if actual_duration < 50% * expected_answer_time_s -> nervous=True
-#     else expected time is neutral.
+# ============================================================
+# NOTE ON CORRECT AUDIO SEGMENT (Furhat Realtime API integration)
+# ============================================================
+# For this module to interpret speaking duration correctly, the audio you pass
+# in MUST cover only the user’s actual speech, NOT the silent reaction time
+# after the robot’s question.
 #
-# Public API:
-#   - build_baseline_on_first_answer(audio_pcm16le, sample_rate, text) -> NervousBaseline
-#   - is_user_nervous_on_answer(baseline, audio_pcm16le, sample_rate, text, expected_answer_time_s=None) -> bool
+# Recommended pattern on the Furhat side:
 #
-# Audio expected:
-#   mono PCM16LE bytes (raw). Recommended 16kHz.
+#   1) In on_speak_end (when the robot finishes asking the question):
+#
+#        await furhat.request_audio_start(
+#            sample_rate=16000,
+#            microphone=True,
+#            speaker=False,
+#        )
+#        self.is_audio_recording = False   # start streaming, but DO NOT write to buffer yet
+#
+#   2) In on_hear_start (when the user starts speaking for the first time):
+#
+#        self.t_speech_start = time.time()  # for reaction_time_s
+#        self.is_audio_recording = True     # from this moment, append audio frames to buffer
+#
+#   3) In on_audio_data:
+#
+#        if self.is_audio_recording:
+#            # append microphone PCM16LE bytes to current_answer_audio
+#
+# With this pattern:
+#   - The PCM segment passed into nervous_detector_voice only contains
+#     “user speaking from first word to end of answer”.
+#   - af["duration_s"] then matches your intuitive “speaking time”, without
+#     reaction-time silence at the beginning.
+#   - The expected_answer_time_s rule truly compares “spoken length vs. expected
+#     answer length” instead of “(reaction time + speech) vs. expected”, which
+#     makes the nervousness judgement more meaningful.
+
+#
+# ============================================================
+# HOW TO USE – STEP BY STEP (FOR FURHAT + EXPRESSION FUSION)
+# ============================================================
+#
+# This module only does AUDIO + TEXT nervousness scoring.
+# You integrate it with:
+#   - Furhat Realtime API (for ASR / audio stream)
+#   - Your facial-expression module (for visual nervousness)
+#
+# ------------------------------------------------------------
+# 0) IMPORT & INITIAL SETUP (Python side)
+# ------------------------------------------------------------
+#
+# from nervous_detector_voice import (
+#     NervousBaseline,
+#     FillerCounter,
+#     build_baseline_on_first_answer,
+#     finalize_nervous_answer,
+# )
+#
+# # Create ONE filler counter object and reuse:
+# filler_counter = FillerCounter()
+#
+# # Keep the baseline somewhere (global / session state):
+# nervous_baseline: NervousBaseline | None = None
+#
+#
+# ------------------------------------------------------------
+# 1) WHEN YOU ASK THE VERY FIRST QUESTION (BUILD BASELINE)
+# ------------------------------------------------------------
+#
+# Example: robot asks: "Can you introduce yourself?"
+#
+# 1.1 Start listening with Furhat Realtime API:
+#
+#     await furhat.request_listen_config(
+#         languages=["en-US"],
+#         phrases=["um", "uh", "er", "ah", "eh"],   # help ASR keep fillers
+#     )
+#
+#     filler_counter.reset()
+#
+#     await furhat.request_listen_start(
+#         partial=True,    # VERY IMPORTANT: we want partials
+#         concat=True,     # full utterance as one string
+#         # ... other options ...
+#     )
+#
+# 1.2 While listening, for each response.hear.partial:
+#
+#     # partial_text is the current partial hypothesis from Furhat
+#     filler_counter.on_partial(partial_text)
+#
+#     # DO NOT call nervous detector here; just accumulate fillers.
+#
+# 1.3 When you detect the FIRST answer is finished:
+#
+#     - You should have:
+#         * audio_bytes (PCM16LE mono) for the whole answer
+#         * sample_rate (e.g., 16000)
+#         * final_text: final ASR result (from hear.end)
+#
+#     Then build the baseline:
+#
+#     nervous_baseline = build_baseline_on_first_answer(
+#         audio_bytes,
+#         sample_rate,
+#         final_text,
+#     )
+#
+#     # For the first answer, you usually do NOT use nervous score yet.
+#     # This is considered the "neutral reference" for this user.
+#
+#
+# ------------------------------------------------------------
+# 2) FOR EACH SUBSEQUENT QUESTION (SECOND, THIRD, ...)
+# ------------------------------------------------------------
+#
+# Example: robot asks: "Why are you interested in this role?"
+#
+# 2.1 Ask the question normally. When the robot finishes speaking,
+#     record the timestamp, e.g.:
+#
+#     t_question_end = now()
+#
+# 2.2 Start listening again:
+#
+#     await furhat.request_listen_config(
+#         languages=["en-US"],
+#         phrases=["um", "uh", "er", "ah", "eh"],
+#     )
+#
+#     filler_counter.reset()
+#
+#     await furhat.request_listen_start(
+#         partial=True,
+#         concat=True,
+#         # ... other options ...
+#     )
+#
+# 2.3 While listening, for each response.hear.partial:
+#
+#     filler_counter.on_partial(partial_text)
+#
+#     # (No scoring yet; we just track added fillers in streaming fashion.)
+#
+# 2.4 Detect when the user STARTS SPEAKING:
+#
+#     - When you receive the FIRST non-empty partial or first audio frame
+#       that passes a simple energy threshold, treat that as "speech start":
+#
+#       t_speech_start = now()
+#       reaction_time_s = t_speech_start - t_question_end
+#
+#     - Save reaction_time_s; you'll pass it into finalize_nervous_answer().
+#
+# 2.5 Detect when the user FINISHES the answer (end of current turn):
+#
+#     - At that moment you should have:
+#         * audio_bytes: PCM16LE mono for this answer
+#         * sample_rate: e.g. 16000
+#         * final_text: final ASR transcript (from hear.end)
+#         * reaction_time_s: computed above
+#         * extra_filler_count: filler_counter.count
+#
+#     - Also choose an expected answer duration for this question, e.g.:
+#
+#         expected_answer_time_s = 8.0   # "typical" length in seconds
+#
+#     - Then call:
+#
+#         result = finalize_nervous_answer(
+#             baseline=nervous_baseline,
+#             audio_pcm16le=audio_bytes,
+#             sample_rate=sample_rate,
+#             text=final_text,
+#             expected_answer_time_s=expected_answer_time_s,
+#             reaction_time_s=reaction_time_s,
+#             extra_filler_count=filler_counter.count,
+#         )
+#
+#         nervous_audio   = result["nervous_score"]   # float in [0.0, 1.0]
+#         stop_expression = result["stop_expression"] # always True here
+#
+# 2.6 Tell your facial-expression module to STOP:
+#
+#     - When you get stop_expression == True, send a message / flag to your
+#       face-expression pipeline:
+#
+#         if stop_expression:
+#             expression_module.stop_current_estimation()
+#
+#     - Up to this moment, the face-expression module has been running
+#       continuously on the camera feed during the answer.
+#
+#
+# ------------------------------------------------------------
+# 3) FUSING AUDIO NERVOUSNESS + FACIAL NERVOUSNESS
+# ------------------------------------------------------------
+#
+# Assume the face module also gives a nervousness score in [0, 1], e.g.:
+#
+#     nervous_face = expression_module.current_nervous_score  # 0..1
+#
+# You can combine them with a simple weighted average:
+#
+#     fused_nervous = 0.6 * nervous_audio + 0.4 * nervous_face
+#
+# Then you can threshold / discretize if needed, e.g.:
+#
+#     if fused_nervous >= 0.70:
+#         label = "NERVOUS"
+#     elif fused_nervous <= 0.30:
+#         label = "RELAXED"
+#     else:
+#         label = "NEUTRAL"
+#
+#
+# ------------------------------------------------------------
+# 4) SUMMARY OF PUBLIC FUNCTIONS / CLASSES
+# ------------------------------------------------------------
+#
+#   - class FillerCounter:
+#       * on_partial(text: str) -> None
+#       * reset() -> None
+#       * .count: int  (total fillers seen in streaming partials)
+#
+#   - build_baseline_on_first_answer(audio_pcm16le, sample_rate, text)
+#       -> NervousBaseline
+#
+#   - is_user_nervous_on_answer(
+#         baseline,
+#         audio_pcm16le,
+#         sample_rate,
+#         text,
+#         expected_answer_time_s=None,
+#         reaction_time_s=None,
+#         extra_filler_count=0,
+#     ) -> float nervous_score in [0, 1]
+#
+#   - finalize_nervous_answer(
+#         baseline,
+#         audio_pcm16le,
+#         sample_rate,
+#         text,
+#         expected_answer_time_s=None,
+#         reaction_time_s=None,
+#         extra_filler_count=0,
+#     ) -> dict:
+#         {
+#            "nervous_score": float in [0, 1],
+#            "stop_expression": True
+#         }
+#
+# ============================================================
+# END OF USAGE GUIDE – IMPLEMENTATION BELOW
+# ============================================================
 
 from __future__ import annotations
 
@@ -43,7 +286,7 @@ class NervousBaseline:
     rms_db: float
     duration_s: float
 
-    # text baseline (kept, but used lightly)
+    # text baseline
     wps: float
     filler_rate: float
     repeat_rate: float
@@ -52,25 +295,58 @@ class NervousBaseline:
 
 
 # ============================================================
-# Text features (English) - supportive only
+# Text features (English) + streaming filler counter
 # ============================================================
 
 _word_re = re.compile(r"[a-z']+")
 
-# Note: um/uh/er may be dropped by ASR; we keep them but do NOT rely on them heavily.
 _FILLERS = [
-    "um", "uh", "er", "ah", "eh",
+    "um", "uh", "er", "ah", "eh", "em",
     "like", "you know", "i mean", "sort of", "kind of",
 ]
 _HEDGES = [
     "maybe", "probably", "perhaps", "i guess", "i think",
     "not sure", "to be honest", "kind of", "sort of",
-    "i don't know", "im not sure", "i'm not sure",
 ]
 _REPAIRS = [
     "sorry", "actually", "i mean", "no wait", "wait",
     "let me rephrase", "what i meant", "rather",
 ]
+
+# For streaming partial ASR: only short pure fillers
+FILLER_SET = {"um", "uh", "er", "ah", "eh"}
+
+
+class FillerCounter:
+    """
+    Incremental, "safe" filler counter for partial ASR hypotheses.
+    """
+    def __init__(self):
+        self._last_partial = ""
+        self.count = 0
+
+    def reset(self):
+        self._last_partial = ""
+        self.count = 0
+
+    def on_partial(self, text: str):
+        t = (text or "").lower()
+
+        # Find longest common prefix between previous and current partial.
+        # Only the "new tail" is scanned and counted, so edits in the front
+        # do NOT cause double-counting.
+        i = 0
+        m = min(len(self._last_partial), len(t))
+        while i < m and self._last_partial[i] == t[i]:
+            i += 1
+        added = t[i:]  # only newly added tail
+
+        # Tokenize new tail and count fillers
+        toks = _word_re.findall(added)
+        self.count += sum(1 for w in toks if w in FILLER_SET)
+
+        self._last_partial = t
+
 
 def _tokenize(text: str) -> list[str]:
     return _word_re.findall((text or "").lower())
@@ -241,10 +517,13 @@ def _abs_change_evidence(z: float) -> float:
 
 
 # ============================================================
-# Public API: two functions
+# ✅ Public API: two core functions + one high-level helper
 # ============================================================
 
 def build_baseline_on_first_answer(audio_pcm16le: bytes, sample_rate: int, text: str) -> NervousBaseline:
+    """
+    Build a per-user neutral baseline from their FIRST answer.
+    """
     af = _audio_features(audio_pcm16le, sample_rate)
     tf = _text_features(text, max(af["duration_s"], 1e-6))
 
@@ -267,30 +546,32 @@ def build_baseline_on_first_answer(audio_pcm16le: bytes, sample_rate: int, text:
         repair_rate=tf["repair_rate"],
     )
 
+
 def is_user_nervous_on_answer(
     baseline: NervousBaseline,
     audio_pcm16le: bytes,
     sample_rate: int,
     text: str,
     expected_answer_time_s: Optional[float] = None,
-) -> bool:
+    reaction_time_s: Optional[float] = None,
+    extra_filler_count: int = 0,
+) -> float:
     """
-    Expected-answer-time rule:
-      - if duration < 50% expected -> nervous=True
-      - else time treated as neutral
-    Then audio-dominant nervousness detection vs baseline.
-    Text is only supportive.
+    Estimate nervousness for a single answer, given a baseline.
+
+    Returns:
+        nervous_score in [0.0, 1.0]
     """
     af = _audio_features(audio_pcm16le, sample_rate)
     tf = _text_features(text, max(af["duration_s"], 1e-6))
 
-    # --- strict expected-time rule (your current policy) ---
-    if expected_answer_time_s is not None and expected_answer_time_s > 0:
-        ratio = af["duration_s"] / float(expected_answer_time_s)
-        if ratio < 0.50:
-            return True
+    # Integrate extra fillers from partial ASR, if provided
+    if extra_filler_count > 0 and tf["words"] > 0:
+        base_fillers = tf["filler_rate"] * tf["words"]
+        total_fillers = base_fillers + float(extra_filler_count)
+        tf["filler_rate"] = float(total_fillers / tf["words"])
 
-    # Conservative sigma floors (baseline is one utterance)
+    # Conservative sigma floors (baseline from one utterance)
     SIG = {
         # audio
         "silence_ratio": 0.08,
@@ -336,7 +617,6 @@ def is_user_nervous_on_answer(
     e_loud = _abs_change_evidence(z_loud)  # loudness change either direction
     e_wps  = _abs_change_evidence(z_wps)   # speaking rate change either direction
 
-    # text evidence (supportive only)
     e_text = float(np.mean([
         _pos_evidence(z_fill),
         _pos_evidence(z_rep),
@@ -344,27 +624,74 @@ def is_user_nervous_on_answer(
         _pos_evidence(z_repai),
     ]))
 
+    # --- Time-group evidence: answer duration & reaction time ----
+
+    # 1) Answer duration vs expected
+    time_short_e = 0.0
+    if expected_answer_time_s is not None and expected_answer_time_s > 0.0:
+        ratio = af["duration_s"] / float(expected_answer_time_s)  # ~1.0 -> as expected
+        if ratio < 0.3:
+            time_short_e = 0.9
+        elif ratio < 0.5:
+            time_short_e = 0.7
+        elif ratio < 0.7:
+            time_short_e = 0.4
+        else:
+            time_short_e = 0.0  # long / normal answer -> no extra evidence
+
+    # 2) Reaction time before starting to speak
+    time_rt_e = 0.0
+    if reaction_time_s is not None and reaction_time_s > 0.0:
+        # ~0.5s -> ~0 evidence; ~1.5s -> moderate; >=3s -> strong evidence
+        rt_z = max(0.0, (reaction_time_s - 0.8) / 1.2)
+        time_rt_e = _sigmoid(rt_z)
+
+    time_components = []
+    if time_short_e > 0.0:
+        time_components.append(time_short_e)
+    if time_rt_e > 0.0:
+        time_components.append(time_rt_e)
+    time_group = float(np.mean(time_components)) if time_components else 0.0
+
     # group scores
     pause_group  = float(0.38 * e_sil + 0.32 * e_pr + 0.18 * e_mps + 0.12 * e_xps)
     instab_group = float(0.40 * e_ecv + 0.30 * e_loge + 0.15 * e_loud + 0.15 * e_wps)
     text_group   = e_text
 
-    # Audio-dominant fusion (text is minor)
+    # fuse all groups, including time_group (weights sum to 1.0)
     score = float(
-        0.56 * pause_group +
-        0.36 * instab_group +
-        0.08 * text_group
+        0.35 * pause_group +
+        0.30 * instab_group +
+        0.20 * text_group +
+        0.15 * time_group
     )
-    threshold = 0.62
 
-    # Must have at least one AUDIO group meaningfully high
-    audio_hit = (pause_group >= 0.62) or (instab_group >= 0.62)
-    if not audio_hit:
-        return False
+    return float(np.clip(score, 0.0, 1.0))
 
-    # More robust gating:
-    both_audio = (pause_group >= 0.62 and instab_group >= 0.62)
-    strong_one = (max(pause_group, instab_group) >= 0.80)
-    text_support = (text_group >= 0.65)
 
-    return bool((score >= threshold and both_audio) or (score >= threshold and strong_one and text_support))
+def finalize_nervous_answer(
+    baseline: NervousBaseline,
+    audio_pcm16le: bytes,
+    sample_rate: int,
+    text: str,
+    expected_answer_time_s: Optional[float] = None,
+    reaction_time_s: Optional[float] = None,
+    extra_filler_count: int = 0,
+) -> Dict[str, float]:
+    """
+    High-level helper to be called ONCE when you decide the user's
+    answer is finished.
+    """
+    score = is_user_nervous_on_answer(
+        baseline,
+        audio_pcm16le,
+        sample_rate,
+        text,
+        expected_answer_time_s=expected_answer_time_s,
+        reaction_time_s=reaction_time_s,
+        extra_filler_count=extra_filler_count,
+    )
+    return {
+        "nervous_score": score,
+        "stop_expression": True,
+    }
