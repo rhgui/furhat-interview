@@ -1,6 +1,8 @@
 import streamlit as st
 from furhat_robot import FurhatRobot
 from cv_parser import CVParser
+from question_generator import generate_questions
+
 
 st.set_page_config(page_title="Furhat CV Interview", layout="centered")
 
