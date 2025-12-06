@@ -43,3 +43,22 @@ class FurhatRobot:
         self.attend_user()
         self.smile_gesture()
         self.speak(message)
+
+    def ask_question(self, question_text: str):
+        """
+        Simple helper: attend the user and ask a single question.
+        """
+        self.attend_user()
+        self.speak(question_text)
+
+    def comfort_and_ask_easy(self, comfort_text: str, easy_question_text: str):
+        """
+        Used when module detects nervousness (returns 'Yes').
+
+        The robot first says a comfort sentence, then asks an easier question.
+        """
+        self.attend_user()
+        # Comfort message
+        self.speak(comfort_text)
+        # Then ask the easy question
+        self.speak(easy_question_text)
