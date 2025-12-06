@@ -8,3 +8,8 @@ mediapipe
 opencv-python
 numpy
 websockets
+pydantic
+python-multipart
+aiohttp
+tf-keras
+tensorflow
