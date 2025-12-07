@@ -94,7 +94,6 @@ class FurhatRobot:
         Note: This uses the high-level FurhatClient, not the realtime API.
         """
         self.client.request_speak_text(text=text, wait=True)
-        time.sleep(1)
 
     def execute_sequence(self, message: str):
         """
@@ -126,22 +125,25 @@ class FurhatRobot:
     async def connect_realtime(self):
         """
         Open a WebSocket connection to the Furhat Realtime API.
-
-        This is required if you want to:
-          - receive response.camera.data frames
-          - receive response.audio.data microphone audio
-          - receive ASR events (response.hear.partial / response.hear.end)
         """
         if self.realtime_connected:
             return
 
-        url = f"ws://{self.host}:80/v1/events"
+        port = int(os.getenv("FURHAT_RT_PORT", "9000"))
+        route = os.getenv("FURHAT_RT_ROUTE", "/v1/events")
+        url = f"ws://{self.host}:{port}{route}"
         print(f"[Realtime] Connecting to {url}")
+
         self.ws = await websockets.connect(url)
         self.realtime_connected = True
         self._running = True
 
-        # Start background event loop
+        # ---- optional auth (only if required by Furhat web settings) ----
+        auth_key = os.getenv("FURHAT_AUTH_KEY", "").strip()
+        if auth_key:
+            await self._send_event("request.auth", key=auth_key)
+            # 这里不强制等待 response.auth；如需严格校验可在 _event_loop 里处理 response.auth
+
         self._event_loop_task = asyncio.create_task(self._event_loop())
         print("[Realtime] Connected to WebSocket")
 
@@ -227,26 +229,30 @@ class FurhatRobot:
 
         # -------------------- ASR (listen) control --------------------
 
-    async def start_listen(self, languages=None):
+    async def start_listen(self, languages=None, phrases=None, end_speech_timeout: float = 2.0):
         """
         Start ASR listening (response.hear.* events).
-
-        Parameters:
-            languages: list of language codes, default ["en-US"]
         """
         if not self.realtime_connected:
             raise RuntimeError("Realtime not connected. Call connect_realtime() first.")
 
         if languages is None:
             languages = ["en-US"]
+        if phrases is None:
+            phrases = []
 
         if not self.listening:
             # Configure ASR
-            await self._send_event("request.listen.config", languages=languages)
-            # Start listening; partial + concat recommended for streaming text
-            await self._send_event("request.listen.start", partial=True, concat=True)
+            await self._send_event("request.listen.config", languages=languages, phrases=phrases)
+            # Start listening with explicit end_speech_timeout
+            await self._send_event(
+                "request.listen.start",
+                partial=True,
+                concat=True,
+                end_speech_timeout=float(end_speech_timeout),
+            )
             self.listening = True
-            print(f"[Realtime] Listen started (languages={languages})")
+            print(f"[Realtime] Listen started (languages={languages}, end_speech_timeout={end_speech_timeout})")
 
     async def stop_listen(self):
         """
