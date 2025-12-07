@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Any
 
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
 
 load_dotenv()
 
@@ -297,4 +297,5 @@ class QuestionGenerator:
             next_id += 1
 
         return [q.to_dict() for q in questions]
+
 
