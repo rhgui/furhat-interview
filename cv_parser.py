@@ -2,36 +2,66 @@ import PyPDF2
 import json
 from pathlib import Path
 from typing import Dict
+
 from dotenv import load_dotenv
 import os
-from google import genai
+from openai import OpenAI
 
 # Load .env once at import time
 load_dotenv()
 
+
 class CVParser:
+    """
+    Parse CV PDF files into structured JSON using DeepSeek (OpenAI-compatible API).
+    """
+
     def __init__(self):
-        self.cv_file = "dummy_cv.pdf"  # default, overridden by upload
-        api_key = os.getenv("GEMINI_API_KEY")
+        api_key = os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
-            raise ValueError("GEMINI_API_KEY not set in .env")
-        self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-2.0-flash"
+            raise ValueError("DEEPSEEK_API_KEY not set in .env")
+
+        # DeepSeek uses OpenAI-compatible API
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.deepseek.com",
+        )
+        # Default model name (same as used in QuestionGenerator)
+        self.model_name = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-chat")
+
+        # Default file path (overwritten when a user uploads a file)
+        self.cv_file = "dummy_cv.pdf"
 
     def extract_text_from_pdf(self, file_path: str) -> str:
+        """
+        Extract plain text from a PDF file for LLM parsing.
+        """
+        text = ""
         with open(file_path, "rb") as f:
             reader = PyPDF2.PdfReader(f)
-            text = ""
             for page in reader.pages:
-                t = page.extract_text()
-                if t:
-                    text += "\n" + t
+                page_text = page.extract_text()
+                if page_text:
+                    text += "\n" + page_text
         return text
 
-    def parse_with_gemini(self, text: str) -> Dict:
+    def parse_with_llm(self, text: str) -> Dict:
+        """
+        Parse CV text using DeepSeek and return structured JSON:
+
+        {
+          "name": "Full name",
+          "email": "email or empty string",
+          "education": ["degree, university, years"],
+          "experience": ["job title, company, years"],
+          "skills": ["skill1", "skill2", "skill3"]
+        }
+        """
+
         prompt = (
             "You are a CV parser. Read the CV text and return ONLY valid JSON, "
-            "no markdown, no explanations. Use exactly this schema:\n"
+            "with no markdown, no comments, and no code fences. "
+            "Use EXACTLY the following schema:\n"
             "{\n"
             '  \"name\": \"Full name\",\n'
             '  \"email\": \"email or empty string\",\n'
@@ -44,28 +74,49 @@ class CVParser:
         )
 
         try:
-            response = self.client.models.generate_content(
+            resp = self.client.chat.completions.create(
                 model=self.model_name,
-                contents=prompt,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
             )
-            raw = response.text.strip()
 
-            # Optional debug
-            with open("gemini_raw_debug.txt", "w", encoding="utf-8") as dbg:
+            raw = resp.choices[0].message.content.strip()
+
+            # Debug save: inspect raw output if parsing fails
+            with open("deepseek_cv_raw_debug.txt", "w", encoding="utf-8") as dbg:
                 dbg.write(raw)
 
+            # Remove ```json ... ``` wrappers if present
             if raw.startswith("```"):
-                raw = raw.strip("`")
-                if raw.lower().startswith("json"):
-                    raw = raw[4:].strip()
+                cleaned = raw.strip().strip("`")
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[4:].strip()
+                raw = cleaned
 
             return json.loads(raw)
+
         except Exception as e:
-            return {"name": "Unknown", "skills": [], "error": f"Gemini parse failed: {e}"}
+            # Fallback structure: prevents crash in QuestionGenerator
+            return {
+                "name": "Unknown",
+                "email": "",
+                "education": [],
+                "experience": [],
+                "skills": [],
+                "error": f"DeepSeek CV parsing failed: {e}",
+            }
 
     def parse_cv(self, uploaded_file_path: str | None = None) -> Dict:
+        """
+        Main external entry point.
+
+        If an uploaded file path is provided, parse that file.
+        Otherwise, use the default self.cv_file.
+        """
         file_path = uploaded_file_path or self.cv_file
+
         if not Path(file_path).exists():
-            return {"error": f"File {file_path} not found"}
+            return {"error": f"File not found: {file_path}"}
+
         text = self.extract_text_from_pdf(file_path)
-        return self.parse_with_gemini(text)
+        return self.parse_with_llm(text)
