@@ -28,18 +28,23 @@
 # ======================================================================
 
 from __future__ import annotations
+
 import os
 import json
 from typing import Dict, Any
 
 from dotenv import load_dotenv
-from google import genai
+from openai import OpenAI
+
+# Load environment variables once at import time
+load_dotenv()
 
 
 class TransitionGenerator:
     """
     Generates comfort + connector utterances for interview transitions.
-    Uses a Gemini model to produce short natural language outputs.
+    Uses a DeepSeek model (OpenAI-compatible API) to produce short
+    natural language outputs.
 
     Public API:
         result = generate_transition(
@@ -51,15 +56,19 @@ class TransitionGenerator:
         )
     """
 
-    def __init__(self, model_name: str = "gemini-2.0-flash"):
-        load_dotenv()
-
-        api_key = os.getenv("GEMINI_API_KEY")
+    def __init__(self, model_name: str | None = None):
+        api_key = os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
-            raise ValueError("GEMINI_API_KEY not found. Please set it in .env")
+            raise ValueError("DEEPSEEK_API_KEY not found. Please set it in .env")
 
-        self.client = genai.Client(api_key=api_key)
-        self.model_name = model_name
+        # DeepSeek via OpenAI-compatible client
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.deepseek.com",
+        )
+
+        env_model = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-chat")
+        self.model_name = model_name or env_model
 
     # ==================================================================
     # Utility: remove ```json ... ``` wrappers if present
@@ -67,12 +76,12 @@ class TransitionGenerator:
     @staticmethod
     def _strip_code_fence(text: str) -> str:
         """
-        If the LLM wraps JSON in ```json ... ```
-        this function removes those markdown fences.
+        If the LLM wraps JSON in ```json ... ``` this function
+        removes those markdown fences.
         """
         s = text.strip()
         if s.startswith("```"):
-            s = s.strip("`").strip()
+            s = s.strip().strip("`")
             # Remove a leading 'json'
             if s.lower().startswith("json"):
                 s = s[4:].strip()
@@ -104,11 +113,11 @@ USER_ANSWER:
 TASK
 ----
 1. Provide a short *comfort_text*:
-   - Supportive, kind, validating effort.
+   - Supportive, kind, validating their effort.
    - No clinical or diagnostic language.
    - ONE short sentence.
 
-2. Provide a short *connector_text* that gently leads to the next guided question.
+2. Provide a short *connector_text* that gently leads to the next guided question:
    - Do NOT repeat the full question.
    - Use a soft transition phrase.
    - ONE sentence.
@@ -241,10 +250,11 @@ Your answer MUST be valid JSON ONLY.
 
         Returns:
             Dict with:
-                comfort_text
-                connector_text
-                target_mode       ("guided" or "original")
+                comfort_text   : str
+                connector_text : str
+                target_mode    : "guided" or "original"
         """
+
         # ---------- Decide which prompt to use ----------
         if was_nervous:
             target_mode = "guided"
@@ -268,12 +278,13 @@ Your answer MUST be valid JSON ONLY.
                 next_original_main=next_original_main,
             )
 
-        # ---------- Query Gemini ----------
-        response = self.client.models.generate_content(
+        # ---------- Query DeepSeek ----------
+        resp = self.client.chat.completions.create(
             model=self.model_name,
-            contents=prompt,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5,
         )
-        raw = response.text or ""
+        raw = resp.choices[0].message.content or ""
         raw = self._strip_code_fence(raw)
 
         # ---------- Parse JSON safely ----------
@@ -283,8 +294,8 @@ Your answer MUST be valid JSON ONLY.
             # Fallback behavior if LLM output is malformed
             if was_nervous and not comfort_given:
                 return {
-                    "comfort_text": "Thank you for sharing that. You're doing really well.",
-                    "connector_text": "When you feel ready, I'd like to continue with the next question.",
+                    "comfort_text": "Thank you for sharing that. You are doing really well.",
+                    "connector_text": "When you feel ready, I would like to continue with the next question.",
                     "target_mode": "guided",
                 }
             else:
@@ -306,7 +317,7 @@ Your answer MUST be valid JSON ONLY.
         if not connector_text:
             if target_mode == "guided":
                 connector_text = (
-                    "When you feel ready, I'd like to move on to the next question."
+                    "When you feel ready, I would like to move on to the next question."
                 )
             else:
                 connector_text = (
@@ -321,20 +332,45 @@ Your answer MUST be valid JSON ONLY.
         }
 
 
-
 # ============================================================
-# Local test (for debugging)
+# Local test (for debugging) – optional
 # ============================================================
+if __name__ == "__main__":
+    gen = TransitionGenerator()
 
-# gen = TransitionGenerator()
-#
-# out = gen.generate_transition(
-#     was_nervous=nervous_bool,
-#     comfort_given=already_comforted_bool,
-#     answer_text=transcribed_answer,
-#     next_original_main=next_question["text"],
-#     next_guided_main=next_question["guided_main"],
-# )
-#
-# robot_says(out["comfort_text"] + " " + out["connector_text"])
-# mode = out["target_mode"]
+    answer = "I am a bit nervous but I tried my best in that project."
+    next_orig = "Can you tell me about a project you are proud of?"
+    next_guided = (
+        "You mentioned several projects. Could you choose one and briefly explain what the goal was, "
+        "what you did, and what you learned?"
+    )
+
+    print("\n--- Case 1: nervous + no comfort_given ---")
+    out1 = gen.generate_transition(
+        was_nervous=True,
+        comfort_given=False,
+        answer_text=answer,
+        next_original_main=next_orig,
+        next_guided_main=next_guided,
+    )
+    print(out1)
+
+    print("\n--- Case 2: nervous + comfort_given ---")
+    out2 = gen.generate_transition(
+        was_nervous=True,
+        comfort_given=True,
+        answer_text=answer,
+        next_original_main=next_orig,
+        next_guided_main=next_guided,
+    )
+    print(out2)
+
+    print("\n--- Case 3: not nervous ---")
+    out3 = gen.generate_transition(
+        was_nervous=False,
+        comfort_given=False,
+        answer_text=answer,
+        next_original_main=next_orig,
+        next_guided_main=next_guided,
+    )
+    print(out3)
