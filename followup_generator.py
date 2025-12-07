@@ -1,4 +1,3 @@
-# followup_generator.py
 # ============================================================
 # Dynamic Follow-Up Question Generator (Boolean nervous flag)
 #
@@ -37,12 +36,15 @@ import json
 from typing import Dict, Any
 
 from dotenv import load_dotenv
-from google import genai
+from openai import OpenAI
+
+# Load environment variables once
+load_dotenv()
 
 
 class FollowupGenerator:
     """
-    Dynamic follow-up generator using Gemini.
+    Dynamic follow-up generator using DeepSeek (OpenAI-compatible API).
 
     Typical usage:
 
@@ -67,19 +69,24 @@ class FollowupGenerator:
         }
     """
 
-    def __init__(self, model_name: str = "gemini-2.0-flash"):
+    def __init__(self, model_name: str | None = None):
         """
         Initialize the LLM client for follow-up generation.
 
-        The GEMINI_API_KEY is loaded from the environment via .env.
+        The DEEPSEEK_API_KEY is loaded from the environment via .env.
         """
-        load_dotenv()
-        api_key = os.getenv("GEMINI_API_KEY")
+        api_key = os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
-            raise ValueError("GEMINI_API_KEY not found. Please set it in .env")
+            raise ValueError("DEEPSEEK_API_KEY not found. Please set it in .env")
 
-        self.client = genai.Client(api_key=api_key)
-        self.model_name = model_name
+        # DeepSeek uses OpenAI-compatible API
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.deepseek.com",
+        )
+        # Keep consistent with QuestionGenerator
+        env_model = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-chat")
+        self.model_name = model_name or env_model
 
     # ========================================================
     # Small utility: strip ```json ... ``` code fences
@@ -97,7 +104,7 @@ class FollowupGenerator:
         """
         s = text.strip()
         if s.startswith("```"):
-            s = s.strip("`").strip()
+            s = s.strip().strip("`")
             if s.lower().startswith("json"):
                 s = s[4:].strip()
         return s
@@ -183,7 +190,7 @@ class FollowupGenerator:
         )
 
     # ========================================================
-    # Unified public API (now using is_nervous: bool)
+    # Unified public API (using is_nervous: bool)
     # ========================================================
     def generate_followup(
         self,
@@ -212,19 +219,20 @@ class FollowupGenerator:
                 - followup_question: str (empty if no follow-up needed)
         """
 
-        # Map the boolean nervous flag to internal mode
+        # Map the boolean nervous flag to the appropriate prompt
         if is_nervous:
             prompt = self._build_prompt_guided(main_question, answer_text)
         else:
             prompt = self._build_prompt_neutral(main_question, answer_text)
 
-        # Call the Gemini model
-        response = self.client.models.generate_content(
+        # Call DeepSeek (OpenAI-compatible chat API)
+        resp = self.client.chat.completions.create(
             model=self.model_name,
-            contents=prompt,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5,
         )
 
-        raw = response.text or ""
+        raw = resp.choices[0].message.content or ""
         raw = self._strip_code_fence(raw)
 
         # Try to parse output as JSON
@@ -239,8 +247,17 @@ class FollowupGenerator:
                 "followup_question": "",
             }
 
-        # Extract and normalize the fields
-        need = bool(data.get("need_followup", False))
+        # Robustly interpret "need_followup" in case model returns "true"/"false" strings
+        raw_need = data.get("need_followup", False)
+        if isinstance(raw_need, bool):
+            need = raw_need
+        elif isinstance(raw_need, (int, float)):
+            need = bool(raw_need)
+        elif isinstance(raw_need, str):
+            need = raw_need.strip().lower() == "true"
+        else:
+            need = False
+
         reason = str(data.get("reason", "")).strip()
         followup_question = str(data.get("followup_question", "")).strip()
 
@@ -258,16 +275,16 @@ class FollowupGenerator:
 # ============================================================
 # Optional local test (manual debugging)
 # ============================================================
-# if __name__ == "__main__":
-#     gen = FollowupGenerator()
-#
-#     main_q = "Can you describe a project where you used Python?"
-#     ans = "I used Python in several school projects but I am not sure what details to mention."
-#
-#     print("\n--- Guided mode (is_nervous=True) ---")
-#     out_guided = gen.generate_followup(main_q, ans, is_nervous=True)
-#     print(out_guided)
-#
-#     print("\n--- Neutral mode (is_nervous=False) ---")
-#     out_neutral = gen.generate_followup(main_q, ans, is_nervous=False)
-#     print(out_neutral)
+if __name__ == "__main__":
+    gen = FollowupGenerator()
+
+    main_q = "Can you describe a project where you used Python?"
+    ans = "I used Python in several school projects but I am not sure what details to mention."
+
+    print("\n--- Guided mode (is_nervous=True) ---")
+    out_guided = gen.generate_followup(main_q, ans, is_nervous=True)
+    print(out_guided)
+
+    print("\n--- Neutral mode (is_nervous=False) ---")
+    out_neutral = gen.generate_followup(main_q, ans, is_nervous=False)
+    print(out_neutral)
