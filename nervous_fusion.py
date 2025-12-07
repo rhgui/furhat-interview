@@ -1,4 +1,3 @@
-# nervous_fusion.py
 # ============================================================
 #  Multi-Modal Nervousness Fusion Module
 #
@@ -26,11 +25,9 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 # ==== Audio nervousness detection ====
-# NOTE:
-#   We DO NOT modify nervous_detector_voice.py.
-#   We only use its public APIs:
-#       - build_baseline_on_first_answer(...)
-#       - is_user_nervous_on_answer(...)
+# We use:
+#   - build_baseline_on_first_answer(...)
+#   - is_user_nervous_on_answer(...)  → returns float nervous_score in [0,1]
 from nervous_detector_voice import (
     build_baseline_on_first_answer,
     is_user_nervous_on_answer,
@@ -82,7 +79,6 @@ class FusionConfig:
 @dataclass
 class FusionScores:
     # Audio nervousness score in [0,1]
-    # In this version, it is 1.0 if audio is nervous, else 0.0
     audio_score: float
 
     # Video nervousness score in [0,1]
@@ -197,8 +193,7 @@ class NervousFusion:
 
             extra_filler_count:
                 Number of filler words ("um", "uh", etc.) detected during partial ASR.
-                NOTE: The current audio module does not use this value directly.
-                You can incorporate it here in the fusion layer if desired.
+                Currently unused here but kept for extension.
 
             segment_frames:
                 Video frames collected during the user's answer.
@@ -214,22 +209,20 @@ class NervousFusion:
         self._check_ready()
 
         # ===========================================================
-        #   1) Audio nervousness (bool → mapped to score)
+        #   1) Audio nervousness score in [0,1]
         # ===========================================================
-        # We only use the public API is_user_nervous_on_answer()
-        # from nervous_detector_voice. It returns a boolean.
-        audio_is_nervous = is_user_nervous_on_answer(
+        # is_user_nervous_on_answer already returns a float nervous_score ∈ [0,1]
+        audio_score = is_user_nervous_on_answer(
             baseline=self.audio_baseline,
             audio_pcm16le=audio_bytes,
             sample_rate=sample_rate,
             text=text,
             expected_answer_time_s=expected_answer_time_s,
+            reaction_time_s=reaction_time_s,
+            extra_filler_count=extra_filler_count,
         )
-
-        # Map bool → [0,1] score for fusion
-        # You can tweak these values if you want a softer mapping, e.g.:
-        #   audio_score = 0.8 if audio_is_nervous else 0.2
-        audio_score = 1.0 if audio_is_nervous else 0.0
+        # Safety clip
+        audio_score = float(np.clip(audio_score, 0.0, 1.0))
 
         # ===========================================================
         #   2) Video nervousness score
@@ -251,8 +244,8 @@ class NervousFusion:
         fused_score = A * audio_score + V * video_score
 
         print(
-            "[Fusion] audio_bool={}, audio={:.3f}, video={:.3f}, fused={:.3f}, rel={:.3f}".format(
-                audio_is_nervous, audio_score, video_score, fused_score, reliability
+            "[Fusion] audio_raw={:.3f}, video={:.3f}, fused={:.3f}, rel={:.3f}".format(
+                audio_score, video_score, fused_score, reliability
             )
         )
 
