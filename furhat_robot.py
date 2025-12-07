@@ -103,8 +103,6 @@ class FurhatRobot:
         self.attend_user()
         self.smile_gesture()
         self.speak(message)
-<<<<<<< Updated upstream
-=======
 
     def ask_question(self, question_text: str):
         """
@@ -331,4 +329,4 @@ class FurhatRobot:
             return frame
         except Exception:
             return None
->>>>>>> Stashed changes
+

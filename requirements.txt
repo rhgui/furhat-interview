@@ -3,3 +3,13 @@ PyPDF2
 furhat-realtime-api
 google-genai
 python-dotenv
+deepface
+mediapipe
+opencv-python
+numpy
+websockets
+pydantic
+python-multipart
+aiohttp
+tf-keras
+tensorflow
