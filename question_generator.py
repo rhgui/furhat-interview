@@ -28,8 +28,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Any
 
 from dotenv import load_dotenv
-from google import genai
-
+from openai import OpenAI
 load_dotenv()
 
 
@@ -72,17 +71,21 @@ class InterviewQuestion:
 
 class QuestionGenerator:
     """
-    Generate interview questions from candidate CV data using Google Gemini.
-    The API format is aligned with Person 4's google.genai client.
+    Generate interview questions from candidate CV data using DeepSeek API.
     """
 
     def __init__(self):
-        api_key = os.getenv("GEMINI_API_KEY")
+        api_key = os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
-            raise ValueError("GEMINI_API_KEY not set in .env")
+            raise ValueError("DEEPSEEK_API_KEY not set in .env")
 
-        self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-2.0-flash"
+        # DeepSeek 使用 OpenAI 兼容接口
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.deepseek.com"
+        )
+        # 默认用 deepseek-chat，你也可以在 .env 里配置别的
+        self.model_name = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-chat")
 
     # ---------- fixed warm-up questions (Q1, Q2) ----------
 
@@ -197,26 +200,40 @@ class QuestionGenerator:
                 text = text[4:].strip()
         return text
 
-    def _call_gemini_for_questions(self, prompt: str) -> List[Dict[str, Any]]:
+    def _call_gemini_for_questions(self, prompt: str) -> str:
         """
-        Call Gemini and return a list[dict] parsed from JSON.
-        Each dict should contain: original_main, guided_main,
-        expected_time_s.
+        调用 DeepSeek 模型，返回 LLM 的原始文本。
+        函数名保留 _call_gemini_for_questions，避免改动其它代码。
         """
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=prompt,
+        resp = self.client.chat.completions.create(
+            model=self.model_name,          # 如 deepseek-chat
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            temperature=0.7,
         )
-        raw = response.text or ""
-        raw = self._strip_code_fence(raw)
 
-        # Optional debug
-        with open("gemini_question_raw_debug.txt", "w", encoding="utf-8") as dbg:
-            dbg.write(raw)
+        # 1) 拿到原始文本
+        raw_text = resp.choices[0].message.content
 
-        data = json.loads(raw)
+        # 2) 去掉 ```json ``` 这种 code fence
+        cleaned = self._strip_code_fence(raw_text)
+
+        # 3) 解析 JSON
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            print("⚠ DeepSeek 返回内容不是合法 JSON，错误：", e)
+            print("⚠ 原始文本：", cleaned[:400], "...")
+            return []
+
+        # 4) 保证是 list
         if not isinstance(data, list):
-            raise ValueError("Gemini output is not a JSON array.")
+            print("⚠ 解析结果不是 list，实际类型：", type(data))
+            return []
 
         return data
 
@@ -255,9 +272,14 @@ class QuestionGenerator:
 
         # 2) LLM-generated (3 questions -> Q3, Q4, Q5)
         prompt = self._build_prompt_for_cv_questions(cv_data, position)
-        raw_items = self._call_gemini_for_questions(prompt)
+        raw_items = self._call_gemini_for_questions(prompt)  # 现在是 list[dict]
 
-        # We only need 3 questions; if Gemini returns more, ignore the rest.
+        # 如果 LLM 出错，raw_items 可能是空
+        if not raw_items:
+            print("⚠ LLM 没有返回可用的问题，暂时只保留 Q1/Q2。")
+            return [q.to_dict() for q in questions]
+
+        # 只取前三个，作为 Q3–Q5
         max_llm_q = 3
         raw_items = raw_items[:max_llm_q]
 
@@ -269,7 +291,6 @@ class QuestionGenerator:
             original_main = str(item.get("original_main", "")).strip()
             guided_main = str(item.get("guided_main", "")).strip()
 
-            # expected_time_s should be numeric; fall back if missing/bad.
             expected_raw = item.get("expected_time_s", 45)
             try:
                 expected_time = float(expected_raw)
@@ -277,17 +298,12 @@ class QuestionGenerator:
                 expected_time = 45.0
 
             if not original_main:
-                # skip malformed entries
                 continue
-
-            # All CV-based questions are tagged as 'medium'
-            diff = "medium"
-
 
             q = InterviewQuestion(
                 id=f"Q{next_id}",
                 text=original_main,
-                difficulty=diff,
+                difficulty="medium",
                 expected_time_s=expected_time,
                 category="cv_based",
                 source="cv_based",
@@ -297,5 +313,6 @@ class QuestionGenerator:
             next_id += 1
 
         return [q.to_dict() for q in questions]
+
 
 
